@@ -7,6 +7,41 @@ from plotly.subplots import make_subplots
 import sqlite3
 import os
 
+# ─── 헬퍼 함수: Hex 색상을 RGBA로 변환 (투명도 버그 해결) ─────────────
+def hex_to_rgba(hex_color, alpha=0.2):
+    hex_color = hex_color.lstrip('#')
+    if len(hex_color) == 6:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return hex_color
+
+# ─── 헬퍼 함수: 군집 신뢰 타원(Confidence Ellipse) 계산 ──────────────
+def get_ellipse_points(x, y, n_std=1.5, n_points=100):
+    if len(x) < 3: return [],[]
+    cov = np.cov(x, y)
+    val, vec = np.linalg.eigh(cov)
+    
+    # 고유값 크기순 정렬
+    order = val.argsort()[::-1]
+    val, vec = val[order], vec[:, order]
+    theta = np.degrees(np.arctan2(*vec[:,0][::-1]))
+    
+    t = np.linspace(0, 2 * np.pi, n_points)
+    a = np.sqrt(val[0]) * n_std
+    b = np.sqrt(val[1]) * n_std
+    
+    ell_x = a * np.cos(t)
+    ell_y = b * np.sin(t)
+    
+    rot = np.array([[np.cos(np.radians(theta)), -np.sin(np.radians(theta))],
+                    [np.sin(np.radians(theta)),  np.cos(np.radians(theta))]])
+    
+    ell_rotated = np.dot(rot, np.vstack((ell_x, ell_y)))
+    return np.mean(x) + ell_rotated[0, :], np.mean(y) + ell_rotated[1, :]
+
+
 # ─── DB 연결 ────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "bicycle.db")
 
@@ -149,7 +184,6 @@ FALLBACK_DATA = {
     "양천구":   {"epdo":189,"usage":246707,"risk":7.66,"accident":189,"dead":0,"heavy":24,"light":116,"no_injury":49,"road_exclusive":42,"road_priority":33,"road_shared":25,"intersection_ratio":0.42,"shared_ratio":0.25,"cluster":2},
     "마포구":   {"epdo":123,"usage":211101,"risk":5.83,"accident":123,"dead":0,"heavy":16,"light":76,"no_injury":31,"road_exclusive":38,"road_priority":28,"road_shared":34,"intersection_ratio":0.35,"shared_ratio":0.34,"cluster":2},
     "강서구":   {"epdo":191,"usage":481780,"risk":3.96,"accident":191,"dead":0,"heavy":25,"light":118,"no_injury":48,"road_exclusive":55,"road_priority":28,"road_shared":17,"intersection_ratio":0.30,"shared_ratio":0.17,"cluster":2},
-    "노원구(재)": {"epdo":107,"usage":136062,"risk":7.86,"accident":107,"dead":0,"heavy":14,"light":66,"no_injury":27,"road_exclusive":45,"road_priority":35,"road_shared":20,"intersection_ratio":0.40,"shared_ratio":0.20,"cluster":2},
 }
 
 # ─── 데이터 결정 ──────────────────────────────────────────────────────────
@@ -162,11 +196,10 @@ DANGER_TOP5 = [g for g, _ in _sorted_risk[:5]]
 SAFE_TOP5   = [g for g, _ in _sorted_risk[-5:]]
 ALL_GU      = sorted(GU_DATA.keys())
 
-
-# ─── 군집 정보 ────────────────────────────────────────────────────────────
+# ─── 군집 정보 (첨부 이미지에 맞게 색상 및 테마 수정) ─────────────────────
 CLUSTER_INFO = {
     0: {
-        "name": "교차로 집중형",
+        "name": "교차로 집중 위험형",
         "icon": "🔴",
         "color": "#e63946",
         "bg": "rgba(230,57,70,0.08)",
@@ -175,7 +208,7 @@ CLUSTER_INFO = {
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 0],
     },
     1: {
-        "name": "겸용도로 혼재형",
+        "name": "혼합 위험형",
         "icon": "🟡",
         "color": "#f8961e",
         "bg": "rgba(248,150,30,0.08)",
@@ -184,10 +217,10 @@ CLUSTER_INFO = {
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 1],
     },
     2: {
-        "name": "인프라 양호·관리형",
-        "icon": "🟢",
-        "color": "#43aa8b",
-        "bg": "rgba(67,170,139,0.08)",
+        "name": "저위험 인프라형",
+        "icon": "🔵", # 파란색 톤으로 변경
+        "color": "#3a86ff",
+        "bg": "rgba(58,134,255,0.08)",
         "desc": "전용도로 비율이 높고 위험지수가 낮음. 현 수준 유지·관리와 함께 데이터 기반 미세 조정이 효과적.",
         "policy": ["정기 노면 점검 체계화", "사고 데이터 모니터링 강화", "우수사례 타 구 공유"],
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 2],
@@ -469,9 +502,11 @@ if layer == "Q1":
         ]
         vals_closed = vals + [vals[0]]
         cats_closed = cats + [cats[0]]
+        
+        # [에러 수정 부분]: 8자리 hex 코드(color + "26") 대신 helper 함수로 rgba 변환 사용
         fig = go.Figure(go.Scatterpolar(
             r=vals_closed, theta=cats_closed, fill="toself",
-            fillcolor=color + "26",
+            fillcolor=hex_to_rgba(color, 0.2), 
             line=dict(color=color, width=2), name=title,
         ))
         fig.update_layout(
@@ -518,7 +553,7 @@ if layer == "Q1":
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Q2 — 왜 위험 수준이 다른가?
+#  Q2 — 왜 위험 수준이 다른가? (이미지와 일치하도록 밝은 테마/K-means 스타일 적용)
 # ═══════════════════════════════════════════════════════════════════════════
 elif layer == "Q2":
     st.markdown("""
@@ -534,42 +569,90 @@ elif layer == "Q2":
     """, unsafe_allow_html=True)
 
     df2 = pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()])
-    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#43aa8b"}
-    cluster_names  = {0: "교차로 집중형", 1: "겸용도로 혼재형", 2: "인프라 양호형"}
+    
+    # 이미지와 매칭되는 클러스터 정보 사용
+    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#3a86ff"} 
+    cluster_names  = {0: "군집 3: 교차로 집중 위험형", 1: "군집 2: 혼합 위험형", 2: "군집 1: 저위험 인프라형"}
 
     col_sc, col_info = st.columns([3, 2])
 
     with col_sc:
         fig_sc = go.Figure()
+        
+        # 클러스터별 데이터 및 타원 그리기
         for c_id, c_name in cluster_names.items():
             sub = df2[df2["cluster"] == c_id]
+            x_vals = sub["intersection_ratio"] * 100
+            y_vals = sub["shared_ratio"] * 100
+            
+            # 1) 산점도 마커
             fig_sc.add_trace(go.Scatter(
-                x=sub["intersection_ratio"] * 100,
-                y=sub["shared_ratio"] * 100,
+                x=x_vals, y=y_vals,
                 mode="markers+text",
-                name=f"{CLUSTER_INFO[c_id]['icon']} {c_name}",
-                marker=dict(size=14, color=cluster_colors[c_id],
-                            line=dict(width=1.5, color="white"), opacity=0.85),
+                name=c_name,
+                marker=dict(size=11, color=cluster_colors[c_id],
+                            line=dict(width=1, color="white"), opacity=0.95),
                 text=sub["자치구"], textposition="top center",
-                textfont=dict(size=10, color="white"),
+                textfont=dict(size=11, color="#222", family="Noto Sans KR"), # 밝은 배경이므로 검은 글씨
             ))
+            
+            # 2) 군집 중심 (Centroid) 'X' 표시
+            if len(sub) > 0:
+                mean_x, mean_y = x_vals.mean(), y_vals.mean()
+                fig_sc.add_trace(go.Scatter(
+                    x=[mean_x], y=[mean_y],
+                    mode="markers",
+                    name="군집 중심",
+                    marker=dict(symbol="x", size=10, color=cluster_colors[c_id], line=dict(width=2)),
+                    showlegend=True if c_id == 0 else False # 레전드엔 한 번만 노출
+                ))
+            
+            # 3) 신뢰 타원 (Confidence Ellipse) 그리기
+            if len(x_vals) >= 3:
+                ell_x, ell_y = get_ellipse_points(x_vals.values, y_vals.values, n_std=1.5)
+                # 다각형 닫기
+                ell_x = np.append(ell_x, ell_x[0])
+                ell_y = np.append(ell_y, ell_y[0])
+                
+                fig_sc.add_trace(go.Scatter(
+                    x=ell_x, y=ell_y,
+                    mode="lines", fill="toself",
+                    fillcolor=hex_to_rgba(cluster_colors[c_id], 0.15),
+                    line=dict(color=cluster_colors[c_id], width=1, dash="dash"),
+                    showlegend=False, hoverinfo="skip"
+                ))
+
+        # 밝은 테마 레이아웃 적용 (첨부 이미지 스타일)
         fig_sc.update_layout(
-            title=dict(text="군집 분석: 교차로 사고 비율 vs 겸용도로 비율", font=dict(size=14, color="white")),
-            xaxis=dict(title="교차로 사고 비율 (%)", gridcolor="rgba(255,255,255,0.08)",
-                       color="white", zerolinecolor="rgba(255,255,255,0.15)"),
-            yaxis=dict(title="겸용도로 비율 (%)", gridcolor="rgba(255,255,255,0.08)",
-                       color="white", zerolinecolor="rgba(255,255,255,0.15)"),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,13,20,0.8)",
-            font=dict(color="white", family="Noto Sans KR"),
-            height=500, margin=dict(l=10, r=10, t=50, b=10),
-            legend=dict(bgcolor="rgba(0,0,0,0.3)", bordercolor="rgba(255,255,255,0.1)",
-                        borderwidth=1, font=dict(size=12)),
+            title=dict(text="<b>서울시 자치구별 K-means 군집화 (k=3)</b>", font=dict(size=18, color="black"), x=0.5),
+            xaxis=dict(
+                title="<b>교차로 사고 비율 (%)</b><br>(전체 자전거 사고 중 교차로 발생 비율)",
+                gridcolor="#e9ecef", color="black", range=[-5, 105], zeroline=False,
+                showline=True, linewidth=1, linecolor='black', mirror=True
+            ),
+            yaxis=dict(
+                title="<b>겸용도로 비율 (%)</b><br>(전체 자전거도로 중 겸용도로 비율)",
+                gridcolor="#e9ecef", color="black", range=[-5, 105], zeroline=False,
+                showline=True, linewidth=1, linecolor='black', mirror=True
+            ),
+            paper_bgcolor="white", plot_bgcolor="white",
+            font=dict(color="black", family="Noto Sans KR"),
+            height=650, margin=dict(l=60, r=40, t=60, b=60),
+            legend=dict(
+                x=0.75, y=0.03, bgcolor="white", 
+                bordercolor="#ccc", borderwidth=1, font=dict(size=11, color="black")
+            ),
         )
+
+        # 바깥쪽 테두리를 위한 마크다운 래핑 (이미지의 보라색 테두리 느낌 연출)
+        st.markdown('<div style="border: 4px solid #8A2BE2; padding: 2px; background: white; border-radius: 4px;">', unsafe_allow_html=True)
         st.plotly_chart(fig_sc, use_container_width=True, config={"displayModeBar": False})
+        st.markdown('</div>', unsafe_allow_html=True)
 
     with col_info:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        for c_id, c_info in CLUSTER_INFO.items():
+        for c_id in sorted(CLUSTER_INFO.keys(), reverse=True): # 2, 1, 0 순서 출력
+            c_info = CLUSTER_INFO[c_id]
             gu_list = ", ".join(c_info["gu"][:5]) + ("..." if len(c_info["gu"]) > 5 else "")
             st.markdown(f"""
             <div style="background:{c_info['bg']};border:1px solid {c_info['color']}33;
@@ -590,8 +673,7 @@ elif layer == "Q2":
 
     st.markdown('<div style="margin:0 80px 12px;font-size:15px;font-weight:700;">군집별 위험지수 분포</div>', unsafe_allow_html=True)
 
-    # ── fillcolor 버그 수정: 리터럴 rgba 문자열 사용 ──
-    BOX_FILL = {0: "rgba(230,57,70,0.2)", 1: "rgba(248,150,30,0.2)", 2: "rgba(67,170,139,0.2)"}
+    BOX_FILL = {0: "rgba(230,57,70,0.2)", 1: "rgba(248,150,30,0.2)", 2: "rgba(58,134,255,0.2)"} # 색상 코드 직접 반영
     fig_box = go.Figure()
     for c_id, c_name in cluster_names.items():
         sub = df2[df2["cluster"] == c_id]["risk"]
@@ -663,7 +745,7 @@ elif layer == "Q3":
     st.markdown('<div style="margin:0 80px 16px;font-size:15px;font-weight:700;">정책 우선순위 매트릭스 — 위험지수 × 군집 유형</div>', unsafe_allow_html=True)
 
     df3 = pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()])
-    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#43aa8b"}
+    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#3a86ff"}
     cluster_names  = {0: "교차로 집중형", 1: "겸용도로 혼재형", 2: "인프라 양호형"}
 
     fig_pri = go.Figure()
