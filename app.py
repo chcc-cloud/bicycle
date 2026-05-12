@@ -7,32 +7,52 @@ from plotly.subplots import make_subplots
 import sqlite3
 import os
 
+# ─── 헬퍼: hex → rgba 문자열 (fillcolor 버그 완전 차단) ─────────────────
+def hex_to_rgba(hex_color: str, alpha: float = 0.2) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+# ─── 헬퍼: 신뢰 타원 좌표 계산 ──────────────────────────────────────────
+def get_ellipse_points(x, y, n_std=1.5, n_points=100):
+    if len(x) < 3:
+        return [], []
+    cov = np.cov(x, y)
+    val, vec = np.linalg.eigh(cov)
+    order = val.argsort()[::-1]
+    val, vec = val[order], vec[:, order]
+    theta = np.degrees(np.arctan2(*vec[:, 0][::-1]))
+    t = np.linspace(0, 2 * np.pi, n_points)
+    a = np.sqrt(np.maximum(val[0], 0)) * n_std
+    b = np.sqrt(np.maximum(val[1], 0)) * n_std
+    ell_x = a * np.cos(t)
+    ell_y = b * np.sin(t)
+    rot = np.array([
+        [np.cos(np.radians(theta)), -np.sin(np.radians(theta))],
+        [np.sin(np.radians(theta)),  np.cos(np.radians(theta))],
+    ])
+    ell_r = rot @ np.vstack((ell_x, ell_y))
+    return np.mean(x) + ell_r[0], np.mean(y) + ell_r[1]
+
+
 # ─── DB 연결 ────────────────────────────────────────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(__file__), "bicycle.db")
 
 @st.cache_data(ttl=300)
 def load_db():
-    """bicycle.db에서 실제 데이터 로드"""
     if not os.path.exists(DB_PATH):
         return None
-
     try:
         conn = sqlite3.connect(DB_PATH)
-
-        # ── 이용건수 ──
         try:
             df_usage = pd.read_sql(
                 'SELECT 자치구, "이용건수(평균)" as usage_avg '
-                'FROM "서울시_23,24_자치구별_자전거_이용건수"',
-                conn,
-            )
+                'FROM "서울시_23,24_자치구별_자전거_이용건수"', conn)
         except Exception:
             df_usage = None
 
-        # ── 사고다발지역 (교차로) ──
         try:
-            df_acc = pd.read_sql(
-                """
+            df_acc = pd.read_sql("""
                 SELECT 자치구,
                        SUM(사고건수)    AS total_accident,
                        SUM(사망자수)    AS total_dead,
@@ -41,35 +61,25 @@ def load_db():
                        SUM(부상신고자수) AS total_no_injury,
                        AVG(CASE WHEN is_intersection='교차로' THEN 1.0 ELSE 0.0 END) AS intersection_ratio
                 FROM "23_24_교차로사고다발지역"
-                GROUP BY 자치구
-                """,
-                conn,
-            )
+                GROUP BY 자치구""", conn)
         except Exception:
             df_acc = None
 
-        # ── 도로 유형별 통계 ──
         try:
-            df_road = pd.read_sql(
-                """
+            df_road = pd.read_sql("""
                 SELECT 자치구, 계 AS total_road,
                        전용도로, 전용차로, 우선도로,
                        "경용도로(분리형)"   AS shared_sep,
                        "경용도로(비분리형)" AS shared_nonsep
-                FROM "서울시_자전거 도로 유형별 자치구별 통계"
-                """,
-                conn,
-            )
+                FROM "서울시_자전거 도로 유형별 자치구별 통계" """, conn)
         except Exception:
             df_road = None
 
         conn.close()
-
         if df_acc is None or df_usage is None:
             return None
 
         df = df_acc.merge(df_usage, on="자치구", how="left")
-
         if df_road is not None:
             df = df.merge(df_road, on="자치구", how="left")
             tot = df["total_road"].replace(0, 1).fillna(1)
@@ -81,8 +91,8 @@ def load_db():
             df["road_priority"]  = 20.0
             df["road_shared"]    = 50.0
 
-        df["epdo"]  = (df["total_dead"] * 3 + df["total_heavy"] * 2
-                       + df["total_light"] * 1 + df["total_no_injury"] * 0.5).round(0).astype(int)
+        df["epdo"]  = (df["total_dead"]*3 + df["total_heavy"]*2
+                       + df["total_light"]*1 + df["total_no_injury"]*0.5).round(0).astype(int)
         df["usage"] = df["usage_avg"].fillna(1).astype(int)
         df["risk"]  = (df["epdo"] / df["usage"].replace(0, 1) * 10000).round(2)
         df["intersection_ratio"] = df["intersection_ratio"].fillna(0.5)
@@ -95,20 +105,15 @@ def load_db():
                 return 1
             else:
                 return 2
-
         df["cluster"] = df.apply(_cluster, axis=1)
 
         result = {}
         for _, r in df.iterrows():
             result[r["자치구"]] = {
-                "epdo": int(r["epdo"]),
-                "usage": int(r["usage"]),
-                "risk": float(r["risk"]),
-                "accident": int(r["total_accident"]),
-                "dead": int(r["total_dead"]),
-                "heavy": int(r["total_heavy"]),
-                "light": int(r["total_light"]),
-                "no_injury": int(r["total_no_injury"]),
+                "epdo": int(r["epdo"]), "usage": int(r["usage"]),
+                "risk": float(r["risk"]), "accident": int(r["total_accident"]),
+                "dead": int(r["total_dead"]), "heavy": int(r["total_heavy"]),
+                "light": int(r["total_light"]), "no_injury": int(r["total_no_injury"]),
                 "road_exclusive": float(r["road_exclusive"]),
                 "road_priority":  float(r["road_priority"]),
                 "road_shared":    float(r["road_shared"]),
@@ -117,13 +122,12 @@ def load_db():
                 "cluster": int(r["cluster"]),
             }
         return result
-
     except Exception as e:
         st.sidebar.error(f"DB 오류: {e}")
         return None
 
 
-# ─── 하드코딩 fallback 데이터 ─────────────────────────────────────────────
+# ─── Fallback 데이터 ──────────────────────────────────────────────────────
 FALLBACK_DATA = {
     "강남구":   {"epdo":302,"usage":32910,"risk":91.76,"accident":302,"dead":0,"heavy":45,"light":180,"no_injury":77,"road_exclusive":35,"road_priority":28,"road_shared":37,"intersection_ratio":0.62,"shared_ratio":0.37,"cluster":0},
     "서대문구": {"epdo":53,"usage":9234,"risk":57.39,"accident":53,"dead":0,"heavy":8,"light":32,"no_injury":13,"road_exclusive":20,"road_priority":15,"road_shared":65,"intersection_ratio":0.58,"shared_ratio":0.65,"cluster":1},
@@ -149,71 +153,55 @@ FALLBACK_DATA = {
     "양천구":   {"epdo":189,"usage":246707,"risk":7.66,"accident":189,"dead":0,"heavy":24,"light":116,"no_injury":49,"road_exclusive":42,"road_priority":33,"road_shared":25,"intersection_ratio":0.42,"shared_ratio":0.25,"cluster":2},
     "마포구":   {"epdo":123,"usage":211101,"risk":5.83,"accident":123,"dead":0,"heavy":16,"light":76,"no_injury":31,"road_exclusive":38,"road_priority":28,"road_shared":34,"intersection_ratio":0.35,"shared_ratio":0.34,"cluster":2},
     "강서구":   {"epdo":191,"usage":481780,"risk":3.96,"accident":191,"dead":0,"heavy":25,"light":118,"no_injury":48,"road_exclusive":55,"road_priority":28,"road_shared":17,"intersection_ratio":0.30,"shared_ratio":0.17,"cluster":2},
-    "노원구(재)": {"epdo":107,"usage":136062,"risk":7.86,"accident":107,"dead":0,"heavy":14,"light":66,"no_injury":27,"road_exclusive":45,"road_priority":35,"road_shared":20,"intersection_ratio":0.40,"shared_ratio":0.20,"cluster":2},
 }
 
 # ─── 데이터 결정 ──────────────────────────────────────────────────────────
-db_data = load_db()
-GU_DATA = db_data if db_data else FALLBACK_DATA
+db_data  = load_db()
+GU_DATA  = db_data if db_data else FALLBACK_DATA
 
-# 위험지수 기준 상위5/하위5 동적 계산
 _sorted_risk = sorted(GU_DATA.items(), key=lambda x: x[1]["risk"], reverse=True)
-DANGER_TOP5 = [g for g, _ in _sorted_risk[:5]]
-SAFE_TOP5   = [g for g, _ in _sorted_risk[-5:]]
-ALL_GU      = sorted(GU_DATA.keys())
+DANGER_TOP5  = [g for g, _ in _sorted_risk[:5]]
+SAFE_TOP5    = [g for g, _ in _sorted_risk[-5:]]
+ALL_GU       = sorted(GU_DATA.keys())
 
+# 군집 색상 (이미지와 동일: 빨강/주황/초록)
+C_COLOR = {0: "#e63946", 1: "#f8961e", 2: "#43aa8b"}
+C_FILL  = {0: "rgba(230,57,70,0.15)", 1: "rgba(248,150,30,0.15)", 2: "rgba(67,170,139,0.15)"}
+C_LABEL = {0: "군집 3: 교차로 집중 위험형", 1: "군집 2: 혼합 위험형", 2: "군집 1: 저위험 인프라형"}
 
-# ─── 군집 정보 ────────────────────────────────────────────────────────────
 CLUSTER_INFO = {
     0: {
-        "name": "교차로 집중형",
-        "icon": "🔴",
-        "color": "#e63946",
-        "bg": "rgba(230,57,70,0.08)",
+        "name": "교차로 집중 위험형",
+        "icon": "🔴", "color": C_COLOR[0], "bg": "rgba(230,57,70,0.08)",
         "desc": "교차로 사고 비율이 높고 전용도로 인프라가 상대적으로 부족. 신호 체계 개선과 교차로 자전거 전용 신호 도입이 필요.",
         "policy": ["교차로 자전거 신호 분리", "우회전 구간 안전표시 강화", "교차로 대기공간 확보"],
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 0],
     },
     1: {
-        "name": "겸용도로 혼재형",
-        "icon": "🟡",
-        "color": "#f8961e",
-        "bg": "rgba(248,150,30,0.08)",
+        "name": "혼합 위험형",
+        "icon": "🟡", "color": C_COLOR[1], "bg": "rgba(248,150,30,0.08)",
         "desc": "겸용도로 비율이 높아 보행자·자전거 충돌 위험 상존. 도로 분리 및 겸용도로의 안전 설계 개선이 핵심.",
         "policy": ["겸용도로 물리적 분리 설치", "속도제한 표지 강화", "야간 조명 확충"],
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 1],
     },
     2: {
-        "name": "인프라 양호·관리형",
-        "icon": "🟢",
-        "color": "#43aa8b",
-        "bg": "rgba(67,170,139,0.08)",
+        "name": "저위험 인프라형",
+        "icon": "🟢", "color": C_COLOR[2], "bg": "rgba(67,170,139,0.08)",
         "desc": "전용도로 비율이 높고 위험지수가 낮음. 현 수준 유지·관리와 함께 데이터 기반 미세 조정이 효과적.",
         "policy": ["정기 노면 점검 체계화", "사고 데이터 모니터링 강화", "우수사례 타 구 공유"],
         "gu": [g for g, v in GU_DATA.items() if v["cluster"] == 2],
     },
 }
 
-
 # ─── 페이지 설정 ────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="서울시 자전거 사고 분석",
-    page_icon="🚲",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="서울시 자전거 사고 분석", page_icon="🚲",
+                   layout="wide", initial_sidebar_state="collapsed")
 
 # ─── CSS ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&family=Space+Mono:wght@400;700&display=swap');
-
-:root {
-    --bg:#0d0d14; --surface:#13131f; --surface2:#1a1a2e;
-    --accent:#ff4d6d; --accent2:#4cc9f0; --accent3:#f8961e;
-    --safe:#43aa8b; --danger:#e63946;
-    --text:#e8e8f0; --muted:#6e6e8a; --border:rgba(255,255,255,0.08);
-}
+:root{--bg:#0d0d14;--surface:#13131f;--surface2:#1a1a2e;--accent:#ff4d6d;--accent2:#4cc9f0;--safe:#43aa8b;--danger:#e63946;--text:#e8e8f0;--muted:#6e6e8a;--border:rgba(255,255,255,0.08);}
 html,body,[class*="css"]{font-family:'Noto Sans KR',sans-serif;background-color:var(--bg)!important;color:var(--text)!important;}
 #MainMenu,footer,header{visibility:hidden;}
 .block-container{padding:0!important;max-width:100%!important;}
@@ -250,36 +238,30 @@ html,body,[class*="css"]{font-family:'Noto Sans KR',sans-serif;background-color:
 </style>
 """, unsafe_allow_html=True)
 
-
-# ─── State 초기화 ─────────────────────────────────────────────────────────
+# ─── State ──────────────────────────────────────────────────────────────────
 if "layer" not in st.session_state:
     st.session_state.layer = "Q1"
 if "selected_gu" not in st.session_state:
     st.session_state.selected_gu = None
 
-
-# ─── DB 상태 표시 ─────────────────────────────────────────────────────────
+# ─── DB 상태 ────────────────────────────────────────────────────────────────
 if db_data:
     st.sidebar.success(f"✅ bicycle.db 연결됨 ({len(GU_DATA)}개 자치구)")
 else:
-    st.sidebar.warning("⚠️ bicycle.db 미연결 — 샘플 데이터 사용 중\n\napp.py와 같은 폴더에 bicycle.db를 넣으세요.")
+    st.sidebar.warning("⚠️ bicycle.db 미연결 — 샘플 데이터 사용 중")
 
-
-# ─── Hero ─────────────────────────────────────────────────────────────────
+# ─── Hero ───────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
   <div class="hero-label">🚲 2026 서울시 빅데이터 활용 경진대회</div>
   <div class="hero-title">서울시 자전거 사고다발지역<br>공간적 특징 분석</div>
   <div class="hero-subtitle">자전거 사고의 원인은 구마다 다른 구조를 가지며,<br>
   획일적 인프라 확충이 아닌 <strong>원인 유형에 맞는 맞춤형 정책</strong>이 필요하다.</div>
-  <div class="hero-logic">
-    핵심 논리 흐름 &nbsp;→&nbsp; <strong>어디가 위험한가</strong>&nbsp;/&nbsp;<strong>왜 위험한가</strong>&nbsp;/&nbsp;<strong>무엇을 해야 하는가</strong>
-  </div>
+  <div class="hero-logic">핵심 논리 흐름 &nbsp;→&nbsp; <strong>어디가 위험한가</strong>&nbsp;/&nbsp;<strong>왜 위험한가</strong>&nbsp;/&nbsp;<strong>무엇을 해야 하는가</strong></div>
 </div>
 """, unsafe_allow_html=True)
 
-
-# ─── 레이어 네비게이션 ────────────────────────────────────────────────────
+# ─── Layer 네비 ─────────────────────────────────────────────────────────────
 def set_layer(l):
     st.session_state.layer = l
     st.session_state.selected_gu = None
@@ -300,27 +282,24 @@ with c3:
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-
-# ─── 자치구 선택기 ────────────────────────────────────────────────────────
+# ─── 자치구 선택기 ───────────────────────────────────────────────────────────
 with st.expander("🗺️  자치구별 상세 보기  ▾", expanded=False):
     st.markdown('<div style="font-family:Space Mono,monospace;font-size:11px;letter-spacing:2px;color:#6e6e8a;margin-bottom:12px;">SELECT GU</div>', unsafe_allow_html=True)
-    cols = st.columns(8)
-    with cols[0]:
+    btn_cols = st.columns(8)
+    with btn_cols[0]:
         if st.button("전체", use_container_width=True,
                      type="primary" if st.session_state.selected_gu is None else "secondary"):
             st.session_state.selected_gu = None; st.rerun()
     for i, gu in enumerate(ALL_GU):
-        with cols[(i + 1) % 8]:
+        with btn_cols[(i + 1) % 8]:
             if st.button(gu, use_container_width=True,
                          type="primary" if st.session_state.selected_gu == gu else "secondary"):
                 st.session_state.selected_gu = gu; st.rerun()
 
+layer  = st.session_state.layer
+sel_gu = st.session_state.selected_gu
 
-layer   = st.session_state.layer
-sel_gu  = st.session_state.selected_gu
-
-
-# ─── 선택 자치구 상세 패널 ────────────────────────────────────────────────
+# ─── 선택 자치구 패널 ────────────────────────────────────────────────────────
 if sel_gu and sel_gu in GU_DATA:
     d  = GU_DATA[sel_gu]
     cl = CLUSTER_INFO[d["cluster"]]
@@ -342,7 +321,7 @@ if sel_gu and sel_gu in GU_DATA:
         <div class="metric-card"><div class="metric-val">{d['intersection_ratio']*100:.0f}%</div><div class="metric-label">교차로 사고 비율</div></div>
         <div class="metric-card"><div class="metric-val">{d['shared_ratio']*100:.0f}%</div><div class="metric-label">겸용도로 비율</div></div>
       </div>
-      <div style="font-size:13px;color:#aaa;margin-top:4px;">{cl['desc']}</div>
+      <div style="font-size:13px;color:#aaa;">{cl['desc']}</div>
       <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
         {''.join(f'<span style="background:{cl["color"]}22;color:{cl["color"]};padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;">✓ {p}</span>' for p in cl["policy"])}
       </div>
@@ -377,7 +356,8 @@ if layer == "Q1":
     </div>
     """, unsafe_allow_html=True)
 
-    df_q1 = pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()]).sort_values("risk", ascending=False).reset_index(drop=True)
+    df_q1 = (pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()])
+             .sort_values("risk", ascending=False).reset_index(drop=True))
 
     col_chart, col_table = st.columns([3, 2])
 
@@ -403,22 +383,18 @@ if layer == "Q1":
     with col_table:
         df_rank = df_q1[["자치구", "risk", "accident"]].copy()
         df_rank["위험지수_순위"] = range(1, len(df_rank) + 1)
-        df_acc_sorted = df_q1.sort_values("accident", ascending=False).reset_index(drop=True)
-        df_acc_sorted["사고건수_순위"] = range(1, len(df_acc_sorted) + 1)
-        df_merged = df_rank.merge(df_acc_sorted[["자치구", "사고건수_순위"]], on="자치구")
-        df_merged["순위변동"] = df_merged["사고건수_순위"] - df_merged["위험지수_순위"]
+        df_acc_s = df_q1.sort_values("accident", ascending=False).reset_index(drop=True)
+        df_acc_s["사고건수_순위"] = range(1, len(df_acc_s) + 1)
+        df_m = df_rank.merge(df_acc_s[["자치구", "사고건수_순위"]], on="자치구")
+        df_m["순위변동"] = df_m["사고건수_순위"] - df_m["위험지수_순위"]
 
         rows_html = ""
-        for _, r in df_merged.iterrows():
-            delta = r["순위변동"]
-            if delta > 0:
-                arrow = f"<span style='color:#43aa8b'>▲{int(delta)}</span>"
-            elif delta < 0:
-                arrow = f"<span style='color:#e63946'>▼{int(-delta)}</span>"
-            else:
-                arrow = "–"
-            badge = '<span class="badge-danger">위험</span>' if r["자치구"] in DANGER_TOP5 else \
-                    ('<span class="badge-safe">안전</span>' if r["자치구"] in SAFE_TOP5 else "")
+        for _, r in df_m.iterrows():
+            d_val = r["순위변동"]
+            arrow = (f"<span style='color:#43aa8b'>▲{int(d_val)}</span>" if d_val > 0 else
+                     (f"<span style='color:#e63946'>▼{int(-d_val)}</span>" if d_val < 0 else "–"))
+            badge = ('<span class="badge-danger">위험</span>' if r["자치구"] in DANGER_TOP5 else
+                     ('<span class="badge-safe">안전</span>' if r["자치구"] in SAFE_TOP5 else ""))
             rows_html += f"""<tr>
               <td style="font-weight:600">{r['자치구']} {badge}</td>
               <td style="text-align:center;color:#ff6b7a;font-weight:700">{int(r['위험지수_순위'])}</td>
@@ -431,17 +407,15 @@ if layer == "Q1":
         <div style="background:#13131f;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:auto;max-height:650px;">
           <table class="rank-table">
             <thead><tr>
-              <th>자치구</th>
-              <th style="text-align:center">위험지수</th>
-              <th style="text-align:center">사고건수</th>
-              <th style="text-align:center">변동</th>
+              <th>자치구</th><th style="text-align:center">위험지수</th>
+              <th style="text-align:center">사고건수</th><th style="text-align:center">변동</th>
             </tr></thead>
             <tbody>{rows_html}</tbody>
           </table>
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
-    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.08);margin:32px 80px'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.08);margin:32px 80px'>",
+                unsafe_allow_html=True)
 
     # H2 배너
     st.markdown("""
@@ -455,8 +429,8 @@ if layer == "Q1":
 
     col_r1, col_r2, col_r3 = st.columns(3)
 
-    def radar(group_gus, title, color):
-        cats = ["전용도로", "우선도로", "겸용도로", "교차로비율×100", "위험지수/2"]
+    def radar(group_gus, title, color_hex):
+        cats  = ["전용도로", "우선도로", "겸용도로", "교차로비율×100", "위험지수/2"]
         avail = [g for g in group_gus if g in GU_DATA]
         if not avail:
             return go.Figure()
@@ -467,12 +441,11 @@ if layer == "Q1":
             np.mean([GU_DATA[g]["intersection_ratio"] * 100 for g in avail]),
             np.mean([GU_DATA[g]["risk"] for g in avail]) / 2,
         ]
-        vals_closed = vals + [vals[0]]
-        cats_closed = cats + [cats[0]]
+        # fillcolor: hex_to_rgba로 안전하게 변환
         fig = go.Figure(go.Scatterpolar(
-            r=vals_closed, theta=cats_closed, fill="toself",
-            fillcolor=color + "26",
-            line=dict(color=color, width=2), name=title,
+            r=vals + [vals[0]], theta=cats + [cats[0]], fill="toself",
+            fillcolor=hex_to_rgba(color_hex, 0.2),
+            line=dict(color=color_hex, width=2), name=title,
         ))
         fig.update_layout(
             polar=dict(
@@ -493,16 +466,16 @@ if layer == "Q1":
         st.plotly_chart(radar(DANGER_TOP5, "🔴 위험구 Top5", "#e63946"),
                         use_container_width=True, config={"displayModeBar": False})
     with col_r2:
-        st.plotly_chart(radar(SAFE_TOP5, "🟢 안전구 Top5", "#43aa8b"),
+        st.plotly_chart(radar(SAFE_TOP5,   "🟢 안전구 Top5", "#43aa8b"),
                         use_container_width=True, config={"displayModeBar": False})
     with col_r3:
         keys   = ["road_exclusive", "road_priority", "road_shared"]
         labels = ["전용도로", "우선도로", "겸용도로"]
-        danger_vals = [np.mean([GU_DATA[g][k] for g in DANGER_TOP5 if g in GU_DATA]) for k in keys]
-        safe_vals   = [np.mean([GU_DATA[g][k] for g in SAFE_TOP5   if g in GU_DATA]) for k in keys]
+        dv = [np.mean([GU_DATA[g][k] for g in DANGER_TOP5 if g in GU_DATA]) for k in keys]
+        sv = [np.mean([GU_DATA[g][k] for g in SAFE_TOP5   if g in GU_DATA]) for k in keys]
         fig_diff = go.Figure()
-        fig_diff.add_trace(go.Bar(name="위험구", x=labels, y=danger_vals, marker_color="#e63946", opacity=0.85))
-        fig_diff.add_trace(go.Bar(name="안전구", x=labels, y=safe_vals,   marker_color="#43aa8b", opacity=0.85))
+        fig_diff.add_trace(go.Bar(name="위험구", x=labels, y=dv, marker_color="#e63946", opacity=0.85))
+        fig_diff.add_trace(go.Bar(name="안전구", x=labels, y=sv, marker_color="#43aa8b", opacity=0.85))
         fig_diff.update_layout(
             barmode="group",
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -519,6 +492,8 @@ if layer == "Q1":
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Q2 — 왜 위험 수준이 다른가?
+#  · 군집 산점도 (밝은 테마 + 신뢰 타원 + 군집 중심 X)
+#  · 박스플롯 제거
 # ═══════════════════════════════════════════════════════════════════════════
 elif layer == "Q2":
     st.markdown("""
@@ -534,45 +509,109 @@ elif layer == "Q2":
     """, unsafe_allow_html=True)
 
     df2 = pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()])
-    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#43aa8b"}
-    cluster_names  = {0: "교차로 집중형", 1: "겸용도로 혼재형", 2: "인프라 양호형"}
 
     col_sc, col_info = st.columns([3, 2])
 
     with col_sc:
         fig_sc = go.Figure()
-        for c_id, c_name in cluster_names.items():
-            sub = df2[df2["cluster"] == c_id]
+
+        for c_id in [0, 1, 2]:
+            sub    = df2[df2["cluster"] == c_id]
+            x_vals = (sub["intersection_ratio"] * 100).values
+            y_vals = (sub["shared_ratio"] * 100).values
+            color  = C_COLOR[c_id]
+            label  = C_LABEL[c_id]
+
+            # ① 신뢰 타원
+            if len(x_vals) >= 3:
+                ex, ey = get_ellipse_points(x_vals, y_vals, n_std=1.5)
+                ex = np.append(ex, ex[0])
+                ey = np.append(ey, ey[0])
+                fig_sc.add_trace(go.Scatter(
+                    x=ex, y=ey, mode="lines", fill="toself",
+                    fillcolor=hex_to_rgba(color, 0.12),      # ← 안전한 rgba 변환
+                    line=dict(color=color, width=1.5, dash="dash"),
+                    showlegend=False, hoverinfo="skip",
+                ))
+
+            # ② 산점도
             fig_sc.add_trace(go.Scatter(
-                x=sub["intersection_ratio"] * 100,
-                y=sub["shared_ratio"] * 100,
+                x=x_vals, y=y_vals,
                 mode="markers+text",
-                name=f"{CLUSTER_INFO[c_id]['icon']} {c_name}",
-                marker=dict(size=14, color=cluster_colors[c_id],
-                            line=dict(width=1.5, color="white"), opacity=0.85),
-                text=sub["자치구"], textposition="top center",
-                textfont=dict(size=10, color="white"),
+                name=label,
+                marker=dict(size=12, color=color,
+                            line=dict(width=1, color="white"), opacity=0.95),
+                text=sub["자치구"].values,
+                textposition="top center",
+                textfont=dict(size=10, color="#111", family="Noto Sans KR"),
             ))
+
+            # ③ 군집 중심 X
+            if len(x_vals) > 0:
+                fig_sc.add_trace(go.Scatter(
+                    x=[x_vals.mean()], y=[y_vals.mean()],
+                    mode="markers",
+                    marker=dict(symbol="x", size=12, color=color,
+                                line=dict(width=2.5, color=color)),
+                    name="군집 중심" if c_id == 0 else None,
+                    showlegend=(c_id == 0),
+                    hovertemplate=f"군집 중심<br>교차로: {x_vals.mean():.1f}%<br>겸용도로: {y_vals.mean():.1f}%<extra></extra>",
+                ))
+
         fig_sc.update_layout(
-            title=dict(text="군집 분석: 교차로 사고 비율 vs 겸용도로 비율", font=dict(size=14, color="white")),
-            xaxis=dict(title="교차로 사고 비율 (%)", gridcolor="rgba(255,255,255,0.08)",
-                       color="white", zerolinecolor="rgba(255,255,255,0.15)"),
-            yaxis=dict(title="겸용도로 비율 (%)", gridcolor="rgba(255,255,255,0.08)",
-                       color="white", zerolinecolor="rgba(255,255,255,0.15)"),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(13,13,20,0.8)",
-            font=dict(color="white", family="Noto Sans KR"),
-            height=500, margin=dict(l=10, r=10, t=50, b=10),
-            legend=dict(bgcolor="rgba(0,0,0,0.3)", bordercolor="rgba(255,255,255,0.1)",
-                        borderwidth=1, font=dict(size=12)),
+            title=dict(
+                text="<b>서울시 자치구별 K-means 군집화 (k=3)</b>",
+                font=dict(size=17, color="#111"), x=0.5, xanchor="center"
+            ),
+            xaxis=dict(
+                title="<b>교차로 사고 비율 (%)</b><br><sub>(전체 자전거 사고 중 교차로 발생 비율)</sub>",
+                gridcolor="#e9ecef", color="#333",
+                range=[-2, 105], zeroline=False,
+                showline=True, linewidth=1, linecolor="#bbb", mirror=True,
+            ),
+            yaxis=dict(
+                title="<b>겸용도로 비율 (%)</b><br><sub>(전체 자전거도로 중 겸용도로 비율)</sub>",
+                gridcolor="#e9ecef", color="#333",
+                range=[-2, 105], zeroline=False,
+                showline=True, linewidth=1, linecolor="#bbb", mirror=True,
+            ),
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            font=dict(color="#333", family="Noto Sans KR"),
+            height=640,
+            margin=dict(l=60, r=30, t=70, b=70),
+            legend=dict(
+                x=0.01, y=0.01,
+                bgcolor="white", bordercolor="#ddd", borderwidth=1,
+                font=dict(size=11, color="#333"),
+            ),
         )
+
+        # 이미지의 보라색 테두리 연출
+        st.markdown('<div style="border:3px solid #7b2d8b;border-radius:6px;overflow:hidden;background:white;">',
+                    unsafe_allow_html=True)
         st.plotly_chart(fig_sc, use_container_width=True, config={"displayModeBar": False})
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 범례 설명 (이미지 하단 텍스트 스타일)
+        st.markdown("""
+        <div style="background:white;border:1px solid #ddd;border-radius:8px;
+             padding:12px 20px;margin-top:8px;font-size:12px;color:#444;">
+          <b>군집 특성 요약</b><br>
+          🔴 <b>군집 3: 교차로 집중 위험형</b> — 교차로 사고 비율 높음 / 겸용도로 낮음<br>
+          🟡 <b>군집 2: 혼합 위험형</b> — 교차로 사고 비율 중간 / 겸용도로 비율 높음<br>
+          🟢 <b>군집 1: 저위험 인프라형</b> — 교차로 사고 비율 낮음 / 겸용도로 낮음<br>
+          <span style="color:#888;font-size:11px;">주: 교차로 사고 비율(23~24 교차로 자전거 사고/전체 자전거 사고) × 겸용도로비율(겸용도로/자전거도로 계)</span>
+        </div>
+        """, unsafe_allow_html=True)
 
     with col_info:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        for c_id, c_info in CLUSTER_INFO.items():
+        for c_id in [2, 1, 0]:          # 저위험 → 혼합 → 고위험 순
+            c_info = CLUSTER_INFO[c_id]
             gu_list = ", ".join(c_info["gu"][:5]) + ("..." if len(c_info["gu"]) > 5 else "")
             st.markdown(f"""
-            <div style="background:{c_info['bg']};border:1px solid {c_info['color']}33;
+            <div style="background:{c_info['bg']};border:1px solid {c_info['color']}44;
                  border-radius:14px;padding:20px;margin-bottom:14px;">
               <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
                 <span style="font-size:24px">{c_info['icon']}</span>
@@ -586,31 +625,6 @@ elif layer == "Q2":
             </div>
             """, unsafe_allow_html=True)
 
-    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.08);margin:8px 80px 32px'>", unsafe_allow_html=True)
-
-    st.markdown('<div style="margin:0 80px 12px;font-size:15px;font-weight:700;">군집별 위험지수 분포</div>', unsafe_allow_html=True)
-
-    # ── fillcolor 버그 수정: 리터럴 rgba 문자열 사용 ──
-    BOX_FILL = {0: "rgba(230,57,70,0.2)", 1: "rgba(248,150,30,0.2)", 2: "rgba(67,170,139,0.2)"}
-    fig_box = go.Figure()
-    for c_id, c_name in cluster_names.items():
-        sub = df2[df2["cluster"] == c_id]["risk"]
-        fig_box.add_trace(go.Box(
-            y=sub,
-            name=f"{CLUSTER_INFO[c_id]['icon']} {c_name}",
-            marker_color=cluster_colors[c_id],
-            line_color=cluster_colors[c_id],
-            fillcolor=BOX_FILL[c_id],
-            boxmean=True,
-        ))
-    fig_box.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white", family="Noto Sans KR"),
-        height=300, margin=dict(l=10, r=10, t=20, b=10),
-        yaxis=dict(title="위험지수", gridcolor="rgba(255,255,255,0.06)", color="white"),
-        showlegend=False,
-    )
-    st.plotly_chart(fig_box, use_container_width=True, config={"displayModeBar": False})
     st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
 
 
@@ -658,21 +672,22 @@ elif layer == "Q3":
             </div>
             """, unsafe_allow_html=True)
 
-    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.08);margin:32px 80px'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border:none;border-top:1px solid rgba(255,255,255,0.08);margin:32px 80px'>",
+                unsafe_allow_html=True)
 
-    st.markdown('<div style="margin:0 80px 16px;font-size:15px;font-weight:700;">정책 우선순위 매트릭스 — 위험지수 × 군집 유형</div>', unsafe_allow_html=True)
+    st.markdown('<div style="margin:0 80px 16px;font-size:15px;font-weight:700;">정책 우선순위 매트릭스 — 위험지수 × 군집 유형</div>',
+                unsafe_allow_html=True)
 
     df3 = pd.DataFrame([{"자치구": k, **v} for k, v in GU_DATA.items()])
-    cluster_colors = {0: "#e63946", 1: "#f8961e", 2: "#43aa8b"}
-    cluster_names  = {0: "교차로 집중형", 1: "겸용도로 혼재형", 2: "인프라 양호형"}
+    cluster_names_q3 = {0: "교차로 집중형", 1: "혼합 위험형", 2: "저위험 인프라형"}
 
     fig_pri = go.Figure()
     for c_id in [0, 1, 2]:
         sub = df3[df3["cluster"] == c_id].sort_values("risk", ascending=False)
         fig_pri.add_trace(go.Bar(
             x=sub["자치구"], y=sub["risk"],
-            name=f"{CLUSTER_INFO[c_id]['icon']} {cluster_names[c_id]}",
-            marker_color=cluster_colors[c_id], opacity=0.85,
+            name=f"{CLUSTER_INFO[c_id]['icon']} {cluster_names_q3[c_id]}",
+            marker_color=C_COLOR[c_id], opacity=0.85,
             text=sub["risk"].round(1), textposition="outside",
             textfont=dict(size=10, color="white"),
         ))
@@ -696,7 +711,7 @@ elif layer == "Q3":
       <div style="font-size:14px;color:#ccc;line-height:1.8;">
         서울시 자치구의 자전거 사고 위험은 <strong style="color:#ff4d6d">이용량 보정 후 사고건수 순위와 크게 달라지며</strong>,
         그 원인은 구마다 상이한 <strong style="color:#4cc9f0">도로 환경 구조</strong>에서 비롯됩니다.<br><br>
-        K=3 군집 분석 결과, 자치구는 ①교차로 집중형 ②겸용도로 혼재형 ③인프라 양호형으로 분류되며,
+        K=3 군집 분석 결과, 자치구는 ①교차로 집중형 ②혼합 위험형 ③저위험 인프라형으로 분류되며,
         각 유형에 맞는 <strong style="color:#f8961e">맞춤형 정책</strong>이 요구됩니다.
         <strong>원인에 기반한 구별 차별화 전략</strong>이 서울시 자전거 안전의 핵심입니다.
       </div>
